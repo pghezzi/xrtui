@@ -72,8 +72,10 @@ static PyObject *get_randr_outputs(PyObject *self, PyObject *args)
             XRRFreeCrtcInfo(crtc);
         } else {
             PyDict_SetItemString(obj, "resolution", Py_None);
-            PyDict_SetItemString(obj, "refresh", Py_None);
-            PyDict_SetItemString(obj, "position", Py_None);
+            PyDict_SetItemString(obj, "refresh",
+                        PyFloat_FromDouble(0));
+            PyDict_SetItemString(obj, "position",
+                PyUnicode_FromFormat("%d,%d", 0, 0));
         }
 
         /* Available modes */

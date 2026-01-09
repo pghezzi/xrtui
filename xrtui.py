@@ -1,43 +1,49 @@
-import curses
 import subprocess
-import re
 import randr
-
-UP = (curses.KEY_UP, ord('k'))
-DOWN = (curses.KEY_DOWN, ord('j'))
-LEFT = (curses.KEY_LEFT, ord('h'))
-RIGHT = (curses.KEY_RIGHT, ord('l'))
-ENTER = (curses.KEY_ENTER, 10, 13, ord('i'))
-
-
-
+from cursed_tools import *
 
 class Display:
     def __init__(self, data: dict):
-        self.name: str = data.get("name")
+        self._name: str = data.get("name")
         self.primary: bool = bool(data.get("primary", False))
 
         self.physical_size_mm = data.get("physical_size_mm")
         self.modes_dict: dict[str, list[float]] = self._parse_modes(data.get("modes", {}))
 
         self.resolution: str | None = data.get("resolution")
-        self.refresh: float | None = self._float_format(data.get("refresh", 0))
+        self.refresh: float | None = self._float_format(data.get("refresh", 0.0))
         self.position: list[int, int] | None = self._parse_position(
             data.get("position")
         )
         self.active = self.resolution is not None
         self.updated = True
-    
+
+    @staticmethod
+    def headers():
+        return ["Output", "Active", "Primary", "Resolution", "Refresh", "X Position", "Y Position"]
+
+    @staticmethod
+    def widgets():
+        return {
+            "Resolution" : ("select", lambda row : row.get_resolutions(), lambda row, value : row.set_resolution(value), lambda row: row.resolution), 
+            "Refresh": ("select", lambda row : row.get_rates(), lambda row, value : row.set_rate(value), lambda row: str(row.refresh)),
+            "Primary": ("select", lambda row : [True, False], lambda row, value: prim(self, row, value), lambda row: row.primary),
+            "Active": ("select", lambda row: [True, False], lambda row, value: row.set_active(value), lambda row: row.active),
+            "X Position": ("buffer", lambda row: row.position[0], lambda row, value: row.set_pos(value, row.position[1])),
+            "Y Position": ("buffer", lambda row: row.position[1], lambda row, value: row.set_pos(row.position[0], value))
+        }
+
     @staticmethod
     def _float_format(val):
-        return f"{val:.2f}"
+        if val:
+            return f"{val:.2f}"
+        return "0.0"
 
     @staticmethod
     def _parse_modes(modes):
         for k in modes:
             modes[k] = list(map(Display._float_format, modes[k]))
         return modes
-
     
     @staticmethod
     def _parse_position(pos):
@@ -48,6 +54,38 @@ class Display:
             return [int(x), int(y)]
         except Exception:
             return [0, 0]
+
+    @property
+    def name(self) -> int | None:
+        if self.updated:
+            return self._name
+        return "*" + self._name
+
+
+    @property
+    def width(self) -> int | None:
+        if not self.resolution:
+            return None
+        return int(self.resolution.split("x")[0])
+
+    @property
+    def height(self) -> int | None:
+        if not self.resolution:
+            return None
+        return int(self.resolution.split("x")[1])
+
+    @property
+    def physical_size(self) -> tuple[int, int] | None:
+        if not self.physical_size_mm:
+            return None
+        try:
+            w, h = self.physical_size_mm.split("x")
+            return int(w), int(h)
+        except Exception:
+            return None
+
+    def info_tuple(self):
+        return self.name, str(self.active), str(self.primary), str(self.resolution), self.refresh, str(self.position[0]), str(self.position[1])
 
     def get_resolutions(self):
         return list(self.modes_dict.keys())
@@ -92,13 +130,13 @@ class Display:
             if self.resolution is None:
                 cmd = [
                     "xrandr",
-                    "--output", self.name,
+                    "--output", self._name,
                     "--auto",
                 ]
             else:
                 cmd = [
                     "xrandr",
-                    "--output", self.name,
+                    "--output", self._name,
                     "--mode", self.resolution,
                     "--rate", str(self.refresh),
                     "--pos", f"{self.position[0]}x{self.position[1]}"
@@ -106,7 +144,7 @@ class Display:
         else:
             cmd = [
                 "xrandr",
-                "--output", self.name,
+                "--output", self._name,
                 "--off"
             ]
 
@@ -120,120 +158,21 @@ class Display:
             pass
 
     def __repr__(self):
-        return f"{self.name} connected {'primary ' if self.primary else ''}{ self.resolution + '+' + str(self.position_x) + '+' + str(self.position_y) + ' @ ' + str(self.refresh) + ' ' if self.resolution else ''}{self.size_x}mm x {self.size_y}mm"
-    
+        return f"{self._name} connected {'primary ' if self.primary else ''}{ self.resolution + '+' + str(self.position_x) + '+' + str(self.position_y) + ' @ ' + str(self.refresh) + ' ' if self.resolution else ''}{self.size_x}mm x {self.size_y}mm"
 
-class SelectWidget:
-    def __init__(self, row, func, update, selected = None):
-        self.row = row
-        self.data = func(row)
-        self.selected_func = selected
-        self.selected_row = 0
-        self.update_func = update
-        self.first = True
 
-    def render(self, stdscr, start_y, start_x, width):
-        height = len(self.data) + 2
 
-        for x in range(start_x, start_x + width):
-            stdscr.addch(start_y, x, curses.ACS_HLINE)
-            stdscr.addch(start_y + height - 1, x, curses.ACS_HLINE)
 
-        for y in range(start_y, start_y + height):
-            stdscr.addch(y, start_x, curses.ACS_VLINE)
-            stdscr.addch(y, start_x + width - 1, curses.ACS_VLINE)
-
-        stdscr.addch(start_y, start_x, curses.ACS_ULCORNER)
-        stdscr.addch(start_y, start_x + width - 1, curses.ACS_URCORNER)
-        stdscr.addch(start_y + height - 1, start_x, curses.ACS_LLCORNER)
-        stdscr.addch(start_y + height - 1, start_x + width - 1, curses.ACS_LRCORNER)
-        
-        self.selected = self.selected_func(self.row)
-        for i, item in enumerate(self.data):
-            text = str(item)
-            y = start_y + 1 + i
-            x = start_x + 1
-            if item == self.selected:
-                text = '*' + text
-                if self.first:
-                    self.selected_row = i
-            if i == self.selected_row and (not self.first or item == self.selected):
-                stdscr.attron(curses.A_REVERSE)
-            stdscr.addstr(y, x, text + " " *(width - 2 - len(text)))
-            if i == self.selected_row and (not self.first or item == self.selected):
-                stdscr.attroff(curses.A_REVERSE)
-        self.first = False
-    
-    def update(self, key):
-        if key in UP and self.selected_row > 0:
-            self.selected_row -= 1
-        elif key in DOWN and self.selected_row < len(self.data) - 1:
-            self.selected_row += 1
-        if key in ENTER:
-            self.update_func(self.row, self.data[self.selected_row])
-        return False
-
-class BufferWidget:
-    def __init__(self, row, buff, update):
-        self.row = row
-        self.buffer = str(buff)
-        self.update_func = update
-
-    def render(self, stdscr, start_y, start_x, width):
-        height = 3
-        width = max(len(self.buffer)+3, width)
-
-        for x in range(start_x, start_x + width):
-            stdscr.addch(start_y, x, curses.ACS_HLINE)
-            stdscr.addch(start_y + height - 1, x, curses.ACS_HLINE)
-
-        for y in range(start_y, start_y + height):
-            stdscr.addch(y, start_x, curses.ACS_VLINE)
-            stdscr.addch(y, start_x + width - 1, curses.ACS_VLINE)
-
-        stdscr.addch(start_y, start_x, curses.ACS_ULCORNER)
-        stdscr.addch(start_y, start_x + width - 1, curses.ACS_URCORNER)
-        stdscr.addch(start_y + height - 1, start_x, curses.ACS_LLCORNER)
-        stdscr.addch(start_y + height - 1, start_x + width - 1, curses.ACS_LRCORNER)
-
-        y = start_y + 1
-        x = start_x + 1
-        stdscr.addstr(y, x, self.buffer)
-        x += len(self.buffer)
-        stdscr.attron(curses.A_REVERSE)
-        stdscr.addstr(y, x, " ")
-        x += 1 
-        stdscr.attroff(curses.A_REVERSE)
-        stdscr.addstr(y, x, " " *(width - 3 - len(self.buffer)))
-    
-    def update(self, key):
-        if key == 8:
-            self.buffer = self.buffer[:-1]
-        if chr(key) in ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]:
-            self.buffer += chr(key)
-        if key in ENTER:
-            self.update_func(self.row, int(self.buffer))
-            return True
-        return False
 
 def prim(table, row, value):
-    for x in table.data:
-        x.primary = False
-    row.set_primary(value)
+    if value:
+        for x in table.data:
+            x.primary = False    
+            row.set_primary(value)
 
 class Displays_Table:
     def __init__(self):
-        self.headers = ["Output", "Active", "Primary", "Resolution", "Refresh", "X Position", "Y Position"]
-        self.col_widths = [12, 12, 12, 14, 12, 12, 12]
-        self.sum_col_widths = [sum(self.col_widths[:i]) for i in range(len(self.col_widths))]
-        self.widgets = {
-            "Resolution" : ("select", lambda row : row.get_resolutions(), lambda row, value : row.set_resolution(value), lambda row: row.resolution), 
-            "Refresh": ("select", lambda row : row.get_rates(), lambda row, value : row.set_rate(value), lambda row: str(row.refresh)),
-            "Primary": ("select", lambda row : [True, False], lambda row, value: prim(self, row, value), lambda row: str(row.primary)),
-            "Active": ("select", lambda row: [True, False], lambda row, value: row.set_active(value), lambda row: str(row.active)),
-            "X Position": ("buffer", lambda row: row.position[0], lambda row, value: row.set_pos(value, row.position[1])),
-            "Y Position": ("buffer", lambda row: row.position[1], lambda row, value: row.set_pos(row.position[0], value))
-        }
+        
         self.data = []
         self.displays = []
         self.selected_row = 0
@@ -244,6 +183,10 @@ class Displays_Table:
         self.wid = None
 
     def set_items(self, data):
+        self.headers = Display.headers()
+        self.widgets = Display.widgets()
+        self.col_widths = [12] * len(self.headers)
+        self.sum_col_widths = [sum(self.col_widths[:i]) for i in range(len(self.col_widths))]
         self.data = data
         self.displays = [d.name for d in data]
 
@@ -258,7 +201,7 @@ class Displays_Table:
             y = i + 3
             if i == self.selected_row:
                 stdscr.attron(curses.A_REVERSE)
-            for j, cell in enumerate([row.name, str(row.active), str(row.primary), str(row.resolution), row.refresh, str(row.position[0]), str(row.position[1])]):
+            for j, cell in enumerate(row.info_tuple()):
                 if i == self.selected_row and j == self.selected_column:
                     stdscr.attroff(curses.A_REVERSE)
                 stdscr.addstr(y, x, " "*self.col_widths[j])
@@ -362,20 +305,18 @@ def get_randr_outputs():
 #                current_output.add_mode(resolution, rates)
 #    return outputs
 
-
 def draw_table(stdscr, table):
     stdscr.clear()
     h, w = stdscr.getmaxyx()
 
     table.render(stdscr)
 
-    stdscr.addstr(h - 2, 2, "h(left), j(down), k(up), l(right) move | ENTER edit | ESC exit edit | q quit | s sync monitors")
+    stdscr.addstr(h - 2, 2, "h(left), j(down), k(up), l(right) move | ENTER edit | ESC exit edit | q quit | s sync monitors | r reload")
     stdscr.refresh()
 
 def main(stdscr):
     curses.curs_set(0)
     stdscr.keypad(True)
-
     data = get_randr_outputs()
     table = Displays_Table()
     table.set_items(data)

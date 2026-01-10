@@ -2,11 +2,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <ncurses.h>
 #include <panel.h>
 #include <X11/Xlib.h>
 #include <X11/extensions/Xrandr.h>
 #include <sys/wait.h>
+#include <math.h>
 
 #define X_OFFSET 1
 #define Y_OFFSET 2
@@ -119,10 +121,10 @@ int get_randr_outputs(DisplayInfo *info) {
                             ModeGroup *mi = &dst->modes[dst->mode_count++];
                             mi->width = res->modes[m].width;
                             mi->height = res->modes[m].height;
+                            //mi->mode_id[mi->refresh_count] = res->modes[m].id;
                             mi->refresh_rates[mi->refresh_count++] =
                               (double)res->modes[m].dotClock /
                               (res->modes[m].hTotal * res->modes[m].vTotal);
-                            //mi->id[mi->refresh_count++] = res->modes[m].id;
                             //printf("hell");
                             break;
                         }
@@ -139,84 +141,114 @@ int get_randr_outputs(DisplayInfo *info) {
 }
 
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
 
-static void
-argv_push(char **argv, int *argc, const char *arg)
-{
-    argv[*argc] = strdup(arg);
-    (*argc)++;
-}
-
-int apply_xrandr_cli(DisplayInfo *info)
+int apply_xrandr_lib(DisplayInfo *info)
 {
     if (!info)
         return -1;
 
-    /* generous arg limit */
-    char *argv[512];
-    int argc = 0;
+    Display *dpy = XOpenDisplay(NULL);
+    if (!dpy)
+        return -1;
 
-    argv_push(argv, &argc, "xrandr");
+    Window root = DefaultRootWindow(dpy);
+    XRRScreenResources *res = XRRGetScreenResourcesCurrent(dpy, root);
+    if (!res) {
+        XCloseDisplay(dpy);
+        return -1;
+    }
 
     for (int i = 0; i < info->count; i++) {
         OutputInfo *o = &info->outputs[i];
-        
-        if (!o->updated) continue;
+        if (!o->updated)
+            continue;
 
-        argv_push(argv, &argc, "--output");
-        argv_push(argv, &argc, o->name);
+        o->updated = FALSE;
+
+        /* find output by name */
+        RROutput output = None;
+        XRROutputInfo *out_info = NULL;
+
+        for (int j = 0; j < res->noutput; j++) {
+            out_info = XRRGetOutputInfo(dpy, res, res->outputs[j]);
+            if (out_info && strcmp(out_info->name, o->name) == 0) {
+                output = res->outputs[j];
+                break;
+            }
+            XRRFreeOutputInfo(out_info);
+            out_info = NULL;
+        }
+
+        if (!out_info || output == None)
+            continue;
 
         if (!o->active) {
-            argv_push(argv, &argc, "--off");
+            if (out_info->crtc) {
+                XRRSetCrtcConfig(
+                    dpy, res, out_info->crtc,
+                    CurrentTime,
+                    0, 0,
+                    None,
+                    RR_Rotate_0,
+                    NULL, 0
+                );
+            }
+            XRRFreeOutputInfo(out_info);
             continue;
         }
 
-        char buf[64];
+        /* find matching mode */
+        RRMode mode = None;
+        for (int m = 0; m < out_info->nmode; m++) {
+            for (int k = 0; k < res->nmode; k++) {
+                XRRModeInfo *mi = &res->modes[k];
+                if (mi->id == out_info->modes[m] &&
+                    mi->width == o->res_width &&
+                    mi->height == o->res_height) {
 
-        snprintf(buf, sizeof(buf),
-                 "%dx%d", o->res_width, o->res_height);
-        argv_push(argv, &argc, "--mode");
-        argv_push(argv, &argc, buf);
-
-        if (o->refresh > 0.0) {
-            snprintf(buf, sizeof(buf),
-                     "%.2f", o->refresh);
-            argv_push(argv, &argc, "--rate");
-            argv_push(argv, &argc, buf);
+                    if (o->refresh > 0.0) {
+                        double rate =
+                            (double)mi->dotClock /
+                            (mi->hTotal * mi->vTotal);
+                        if (fabs(rate - o->refresh) > 0.5)
+                            continue;
+                    }
+                    mode = mi->id;
+                    break;
+                }
+            }
         }
 
-        snprintf(buf, sizeof(buf),
-                 "%dx%d", o->x, o->y);
-        argv_push(argv, &argc, "--pos");
-        argv_push(argv, &argc, buf);
+        if (mode == None) {
+            XRRFreeOutputInfo(out_info);
+            continue;
+        }
+
+        RRCrtc crtc = out_info->crtc ?
+                      out_info->crtc :
+                      out_info->crtcs[0];
+
+        XRRSetCrtcConfig(
+            dpy, res, crtc,
+            CurrentTime,
+            o->x, o->y,
+            mode,
+            RR_Rotate_0,
+            &output, 1
+        );
 
         if (o->is_primary)
-            argv_push(argv, &argc, "--primary");
+            XRRSetOutputPrimary(dpy, root, output);
+
+        XRRFreeOutputInfo(out_info);
     }
 
-    argv[argc] = NULL;
-
-    /* fork + exec */
-    pid_t pid = fork();
-    if (pid == 0) {
-        execvp("xrandr", argv);
-        perror("execvp xrandr");
-        _exit(1);
-    }
-
-    /* parent */
-    int status;
-    waitpid(pid, &status, 0);
-
-    for (int i = 0; i < argc; i++)
-        free(argv[i]);
-
-    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    XRRFreeScreenResources(res);
+    XFlush(dpy);
+    XCloseDisplay(dpy);
+    return 0;
 }
+
 
 
 void render_table(const DisplayInfo *info){
@@ -282,6 +314,9 @@ void render_table(const DisplayInfo *info){
         y++;
         if (i == info->selected_row) attroff(A_REVERSE);
     }
+    int rows, cols;
+    getmaxyx(stdscr, rows, cols);
+    mvprintw(rows - 1, 0, BAR);
 }
 
 void box_maker(int start_y, int start_x, int height, int width){
@@ -468,6 +503,12 @@ typedef enum {
 #define KEY_BACKSPACE_1 127
 #define KEY_BACKSPACE_2 KEY_BACKSPACE
 
+#define RIGHCASE case 'l': case KEY_RIGHT:
+#define LEFTCASE case 'h': case KEY_LEFT:
+#define UPCASE case 'k': case KEY_UP:
+#define DOWNCASE case 'j': case KEY_DOWN:
+
+
 int main(void)
 {
     DisplayInfo info = {0};
@@ -484,15 +525,16 @@ int main(void)
     set_escdelay(0);
     getmaxyx(stdscr, rows, cols);
     keypad(stdscr, TRUE);
+    
     noecho();
     curs_set(0);
     if (has_colors())
         init_color(0, 0, 0, 0);
 
-    info.selected_row = 0;
 
+    scrollok(stdscr, FALSE);
+    info.selected_row = 0;
     render_table(&info);
-    mvprintw(rows - 1, 0, BAR);
     refresh();
 
     while ((key = getch()) != 'q') {
@@ -509,29 +551,33 @@ int main(void)
         }
 
         if (key == 's') {
-            apply_xrandr_cli(&info);
+            apply_xrandr_lib(&info);
+            render_table(&info);
+            refresh();
             continue;
         }
+
+        if (mode == MODE_TABLE && is_esc) break;
 
         switch (mode) {
         case MODE_TABLE:
             switch (key) {
-            case 'h':
+            LEFTCASE
                 if (info.selected_column > 0)
                     info.selected_column--;
                 break;
 
-            case 'l':
+            RIGHCASE
                 if (info.selected_column < 6)
                     info.selected_column++;
                 break;
 
-            case 'k':
+            UPCASE
                 if (info.selected_row > 0)
                     info.selected_row--;
                 break;
 
-            case 'j':
+            DOWNCASE
                 if (info.selected_row < info.count - 1)
                     info.selected_row++;
                 break;
@@ -565,17 +611,16 @@ int main(void)
         /* ================= SELECT MODE ================= */
         case MODE_SELECT:
             switch (key) {
-            case 'h': case KEY_ESC:
+            LEFTCASE case KEY_ESC:
                 mode = MODE_TABLE;
                 clear();
-                mvprintw(rows - 1, 0, BAR);
                 break;
-            case 'k':
+            UPCASE
                 if (widg.selected_row > 0)
                     widg.selected_row--;
                 break;
 
-            case 'j':
+            DOWNCASE
                 if (info.selected_column == 1 ||
                     info.selected_column == 2) {
 
@@ -600,7 +645,7 @@ int main(void)
                 }
                 break;
 
-            case 'l': case KEY_ENTER_1: case KEY_ENTER_2: 
+            RIGHCASE case KEY_ENTER_1: case KEY_ENTER_2: 
                 if (info.selected_column == 1) {
                     widg.row->active = widg.selected_row;
                     widg.row->updated = TRUE;
@@ -626,7 +671,6 @@ int main(void)
                 }
                 mode = MODE_TABLE;
                 clear();
-                mvprintw(rows - 1, 0, BAR);
                 break;
             }
             break;
@@ -635,7 +679,6 @@ int main(void)
             if (key == 'h' || is_esc) {
                 mode = MODE_TABLE;
                 clear();
-                mvprintw(rows - 1, 0, BAR);
                 break;
             }
             if (key == 'l' || is_enter) {
@@ -647,7 +690,6 @@ int main(void)
                 widg.row->updated = TRUE;
                 mode = MODE_TABLE;
                 clear();
-                mvprintw(rows - 1, 0, BAR);
                 break;
             }
 

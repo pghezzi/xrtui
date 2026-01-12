@@ -1,4 +1,5 @@
 #include <X11/X.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,49 +9,46 @@
 #include <X11/Xlib.h>
 #include <X11/extensions/Xrandr.h>
 #include <sys/wait.h>
-#include <math.h>
+#include <signal.h>
 
 #define X_OFFSET 1
 #define Y_OFFSET 2
 #define BAR "h(left/exit), j(down), k(up), l(right/select/enter) move | x delete | q quit | s sync monitors | r reload"
+#define mode_refresh(mode) mode.hTotal && mode.vTotal ? (double)mode.dotClock / ((double)mode.hTotal * (double)mode.vTotal) : 0.0
+
 
 typedef struct {
-    int width;
-    int height;
+    unsigned int width;
+    unsigned int height;
     double refresh_rates[64];
-    int refresh_count;
+    RRMode mode_id[64];
+    unsigned int refresh_count;
 } ModeGroup;
 
 typedef struct {
     char name[64];
-    char is_primary;
-    char active;
-    char updated;
+    unsigned char is_primary;
+    unsigned char active;
+    unsigned char updated;
 
-    int mm_width;
-    int mm_height;
-    int x, y;
-    int res_width;
-    int res_height;
+    unsigned int mm_width;
+    unsigned int mm_height;
+    unsigned int x, y;
+    unsigned int res_width;
+    unsigned int res_height;
     double refresh;
+    RRMode cur_mode;
 
-    ModeGroup modes[128];
-    int mode_count;
+    ModeGroup modes[64];
+    unsigned int mode_count;
 } OutputInfo;
 
 typedef struct {
-    OutputInfo outputs[100];
-    int count;
-    int selected_row;
-    int selected_column;
+    OutputInfo outputs[16];
+    unsigned int count;
+    unsigned int selected_row;
+    unsigned int selected_column;
 } DisplayInfo;
-
-static double mode_refresh(const XRRModeInfo *mode) {
-    if (mode->hTotal && mode->vTotal)
-        return (double)mode->dotClock /
-               ((double)mode->hTotal * (double)mode->vTotal);
-    return 0.0;
-}
 
 
 int get_randr_outputs(DisplayInfo *info) {
@@ -94,9 +92,7 @@ int get_randr_outputs(DisplayInfo *info) {
                 if (res->modes[m].id == crtc->mode) {
                     dst->res_width = res->modes[m].width;
                     dst->res_height = res->modes[m].height;
-                    dst->refresh =
-                        (double)res->modes[m].dotClock /
-                        (res->modes[m].hTotal * res->modes[m].vTotal);
+                    dst->refresh = mode_refresh(res->modes[m]);
                     break;
                 }
             }
@@ -109,23 +105,18 @@ int get_randr_outputs(DisplayInfo *info) {
         for (int j = 0; j < out->nmode; j++) {
             for (int m = 0; m < res->nmode; m++) {
                 if (res->modes[m].id == out->modes[j]) {
-                    for (int k = 0; k < dst->mode_count + 1; k++){
+                    for (unsigned int k = 0; k < dst->mode_count + 1; k++){
                         if (dst->modes[k].height == res->modes[m].height && dst->modes[k].width == res->modes[m].width){
                             ModeGroup *mi = &dst->modes[k];
-                            mi->refresh_rates[mi->refresh_count++] =
-                              (double)res->modes[m].dotClock /
-                              (res->modes[m].hTotal * res->modes[m].vTotal);
+                            mi->refresh_rates[mi->refresh_count++] = mode_refresh(res->modes[m]);
                             break;
                         }
                         if (dst->modes[k].height == 0){
                             ModeGroup *mi = &dst->modes[dst->mode_count++];
                             mi->width = res->modes[m].width;
                             mi->height = res->modes[m].height;
-                            //mi->mode_id[mi->refresh_count] = res->modes[m].id;
-                            mi->refresh_rates[mi->refresh_count++] =
-                              (double)res->modes[m].dotClock /
-                              (res->modes[m].hTotal * res->modes[m].vTotal);
-                            //printf("hell");
+                            mi->mode_id[mi->refresh_count] = res->modes[m].id;
+                            mi->refresh_rates[mi->refresh_count++] = mode_refresh(res->modes[m]);
                             break;
                         }
                         
@@ -158,7 +149,7 @@ int apply_xrandr_lib(DisplayInfo *info)
         return -1;
     }
 
-    for (int i = 0; i < info->count; i++) {
+    for (size_t i = 0; i < info->count; i++) {
         OutputInfo *o = &info->outputs[i];
         if (!o->updated)
             continue;
@@ -198,26 +189,7 @@ int apply_xrandr_lib(DisplayInfo *info)
         }
 
         /* find matching mode */
-        RRMode mode = None;
-        for (int m = 0; m < out_info->nmode; m++) {
-            for (int k = 0; k < res->nmode; k++) {
-                XRRModeInfo *mi = &res->modes[k];
-                if (mi->id == out_info->modes[m] &&
-                    mi->width == o->res_width &&
-                    mi->height == o->res_height) {
-
-                    if (o->refresh > 0.0) {
-                        double rate =
-                            (double)mi->dotClock /
-                            (mi->hTotal * mi->vTotal);
-                        if (fabs(rate - o->refresh) > 0.5)
-                            continue;
-                    }
-                    mode = mi->id;
-                    break;
-                }
-            }
-        }
+        RRMode mode = o->cur_mode;
 
         if (mode == None) {
             XRRFreeOutputInfo(out_info);
@@ -269,53 +241,52 @@ void render_table(const DisplayInfo *info){
     x += 12;
     
     int y = 3;
-    for (int i = 0; i < info->count; i++){
+    for (size_t i = 0; i < info->count; i++){
         x = 2;
         if (i == info->selected_row) {
-            attron(A_REVERSE);
+            wattron(stdscr, A_REVERSE);
             mvhline(y, x , ' ', info->selected_column*12);
-            attroff(A_REVERSE);
+            wattroff(stdscr, A_REVERSE);
             mvhline(y, x + info->selected_column*12 , ' ', 12);
-            attron(A_REVERSE);
+            wattron(stdscr, A_REVERSE);
             mvhline(y, x + (info->selected_column + 1)*12, ' ', 12*7 - (info->selected_column + 1)*12);  // fill entire line
         }
         else{
-            attroff(A_REVERSE);
+            wattroff(stdscr, A_REVERSE);
             mvhline(y, x, ' ', 12*7);  // fill entire line
         }
-        if (info->selected_column == 0 && i == info->selected_row) {attroff(A_REVERSE);}
+        if (info->selected_column == 0 && i == info->selected_row) {wattroff(stdscr, A_REVERSE);}
         if (info->outputs[i].updated) mvprintw(y, x, "*%s", info->outputs[i].name);
         else mvprintw(y, x, "%s", info->outputs[i].name);
-        if (info->selected_column == 0 && i == info->selected_row) {attron(A_REVERSE);}
+        if (info->selected_column == 0 && i == info->selected_row) {wattron(stdscr, A_REVERSE);}
         x += 12;
-        if (info->selected_column == 1 && i == info->selected_row) {attroff(A_REVERSE);}
+        if (info->selected_column == 1 && i == info->selected_row) {wattroff(stdscr, A_REVERSE);}
         mvprintw(y, x, "%s", info->outputs[i].active ?  "True" : "False");
-        if (info->selected_column == 1 && i == info->selected_row) {attron(A_REVERSE);}
+        if (info->selected_column == 1 && i == info->selected_row) {wattron(stdscr, A_REVERSE);}
         x += 12;
-        if (info->selected_column == 2 && i == info->selected_row) {attroff(A_REVERSE);}
+        if (info->selected_column == 2 && i == info->selected_row) {wattroff(stdscr, A_REVERSE);}
         mvprintw(y, x, "%s", info->outputs[i].is_primary ?  "True" : "False");
-        if (info->selected_column == 2 && i == info->selected_row) {attron(A_REVERSE);}
+        if (info->selected_column == 2 && i == info->selected_row) {wattron(stdscr, A_REVERSE);}
         x += 12;
-        if (info->selected_column == 3 && i == info->selected_row) {attroff(A_REVERSE);}
+        if (info->selected_column == 3 && i == info->selected_row) {wattroff(stdscr, A_REVERSE);}
         mvprintw(y, x, "%dx%d", info->outputs[i].res_width, info->outputs[i].res_height);
-        if (info->selected_column == 3 && i == info->selected_row) {attron(A_REVERSE);}
+        if (info->selected_column == 3 && i == info->selected_row) {wattron(stdscr, A_REVERSE);}
         x += 12;
-        if (info->selected_column == 4 && i == info->selected_row) {attroff(A_REVERSE);}
+        if (info->selected_column == 4 && i == info->selected_row) {wattroff(stdscr, A_REVERSE);}
         mvprintw(y, x, "%.2f", info->outputs[i].refresh);
-        if (info->selected_column == 4 && i == info->selected_row) {attron(A_REVERSE);}
+        if (info->selected_column == 4 && i == info->selected_row) {wattron(stdscr, A_REVERSE);}
         x += 12;
-        if (info->selected_column == 5 && i == info->selected_row) {attroff(A_REVERSE);}
+        if (info->selected_column == 5 && i == info->selected_row) {wattroff(stdscr, A_REVERSE);}
         mvprintw(y, x, "%d", info->outputs[i].x);
-        if (info->selected_column == 5 && i == info->selected_row) {attron(A_REVERSE);}
+        if (info->selected_column == 5 && i == info->selected_row) {wattron(stdscr, A_REVERSE);}
         x += 12;
-        if (info->selected_column == 6 && i == info->selected_row) {attroff(A_REVERSE);}
+        if (info->selected_column == 6 && i == info->selected_row) {wattroff(stdscr, A_REVERSE);}
         mvprintw(y, x, "%d", info->outputs[i].y);
-        if (info->selected_column == 6 && i == info->selected_row) {attron(A_REVERSE);}
+        if (info->selected_column == 6 && i == info->selected_row) {wattron(stdscr, A_REVERSE);}
         y++;
-        if (i == info->selected_row) attroff(A_REVERSE);
+        if (i == info->selected_row) wattroff(stdscr, A_REVERSE);
     }
-    int rows, cols;
-    getmaxyx(stdscr, rows, cols);
+    int rows = getmaxy(stdscr);
     mvprintw(rows - 1, 0, BAR);
 }
 
@@ -334,14 +305,13 @@ void box_maker(int start_y, int start_x, int height, int width){
     mvaddch(start_y + height - 1, start_x + width - 1, ACS_LRCORNER);
 }
 
-
 ///////////////////////////////////////////////////////////////////////////////
 typedef struct {
     OutputInfo* row;
     char rownumber;
-    char selected_row;
     char buffer[12];
-    int buffer_size;
+    unsigned int selected_row;
+    unsigned int buffer_size;
     char first;
 } Widget;
 
@@ -353,7 +323,7 @@ void draw_select_list(
     Widget *widg,
     void   *items,
     int     item_size,
-    int     count,
+    unsigned int count,
     int     x, int y,
     int     width,
     ItemRenderer render,
@@ -363,7 +333,7 @@ void draw_select_list(
     box_maker(y, x, count + 2, width);
     y++; x++;
 
-    for (int i = 0; i < count; i++) {
+    for (unsigned int i = 0; i < count; i++) {
         void *item = (char*)items + i * item_size;
         char line[64];
         render(item, line, sizeof(line));
@@ -373,11 +343,11 @@ void draw_select_list(
             widg->first = 0;
         }
         if ((!widg->first && i == widg->selected_row) || (widg->first && equiv)) {
-            attron(A_REVERSE);
+            wattron(stdscr, A_REVERSE);
         }
         mvhline(y, x, ' ', width - 2);
         mvprintw(y, x, equiv ? "*%s" : "%s", line);
-        attroff(A_REVERSE);
+        wattroff(stdscr, A_REVERSE);
         y++;
     }
     if (widg->first)
@@ -426,10 +396,10 @@ int refresh_equals(void *item, void *userdata){
 
 void selectwidget_refresh(Widget *widg){
     OutputInfo *info = widg->row;
-    ModeGroup *mode;
-    for (int i = 0; i < info->mode_count; i++) 
+    ModeGroup *mode = &info->modes[0];
+    for (unsigned int i = 0; i < info->mode_count; i++) 
         if (resolution_equals(&info->modes[i], info)) 
-            mode = &info->modes[i];
+            mode = &info->modes[i];  
     draw_select_list(
         widg,
         mode->refresh_rates,
@@ -474,6 +444,7 @@ void selectwidget_active(Widget *widg){
     );
 }
 ///////////////////////////////////////////////////////////////////////////////
+
 void bufferwiget(Widget *widg, int col){
     int x = col * 12;
     int y = 2 + widg->rownumber;
@@ -482,10 +453,9 @@ void bufferwiget(Widget *widg, int col){
     y++;
     mvhline(y, x, ' ', 12);
     mvprintw(y, x, "%s", widg->buffer);
-    attron(A_REVERSE);
+    wattron(stdscr, A_REVERSE);
     mvprintw(y, x + widg->buffer_size, " ");
-    attroff(A_REVERSE);
-    //todo add cool cursor
+    wattroff(stdscr, A_REVERSE);
 }
 
 
@@ -508,14 +478,18 @@ typedef enum {
 #define UPCASE case 'k': case KEY_UP:
 #define DOWNCASE case 'j': case KEY_DOWN:
 
+void handle_sigint(int sig) {
+    endwin();
+    exit(0);
+}
 
 int main(void)
 {
+    signal(SIGINT, handle_sigint);
     DisplayInfo info = {0};
     Widget widg = {0};
     UiMode mode = MODE_TABLE;
 
-    int rows, cols;
     int key;
 
     get_randr_outputs(&info);
@@ -523,9 +497,7 @@ int main(void)
     /* ncurses init */
     initscr();
     set_escdelay(0);
-    getmaxyx(stdscr, rows, cols);
     keypad(stdscr, TRUE);
-    
     noecho();
     curs_set(0);
     if (has_colors())
@@ -535,9 +507,9 @@ int main(void)
     scrollok(stdscr, FALSE);
     info.selected_row = 0;
     render_table(&info);
-    refresh();
+    wrefresh(stdscr);
 
-    while ((key = getch()) != 'q') {
+    while ((key = wgetch(stdscr)) != 'q') {
 
         int is_enter = key == KEY_ENTER || key == '\n';
 
@@ -546,14 +518,20 @@ int main(void)
         int is_backspace = (8 == key || 127 == key || KEY_BACKSPACE == key);
 
         if (key == 'r') {
+            wclear(stdscr);
+            mode = MODE_TABLE;
             get_randr_outputs(&info);
+            render_table(&info);
+            wrefresh(stdscr);
             continue;
         }
 
         if (key == 's') {
+            wclear(stdscr);
+            mode = MODE_TABLE;
             apply_xrandr_lib(&info);
             render_table(&info);
-            refresh();
+            wrefresh(stdscr);
             continue;
         }
 
@@ -613,7 +591,7 @@ int main(void)
             switch (key) {
             LEFTCASE case KEY_ESC:
                 mode = MODE_TABLE;
-                clear();
+                wclear(stdscr);
                 break;
             UPCASE
                 if (widg.selected_row > 0)
@@ -629,14 +607,12 @@ int main(void)
 
                 } else if (info.selected_column == 3) {
 
-                    if (widg.selected_row <
-                        widg.row->mode_count - 1)
+                    if (widg.selected_row < widg.row->mode_count - 1)
                         widg.selected_row++;
 
                 } else if (info.selected_column == 4) {
-
                     ModeGroup *m = NULL;
-                    for (int i = 0; i < widg.row->mode_count; i++)
+                    for (unsigned int i = 0; i < widg.row->mode_count; i++)
                         if (resolution_equals(&widg.row->modes[i], widg.row))
                             m = &widg.row->modes[i];
 
@@ -647,30 +623,32 @@ int main(void)
 
             RIGHCASE case KEY_ENTER_1: case KEY_ENTER_2: 
                 if (info.selected_column == 1) {
-                    widg.row->active = widg.selected_row;
-                    widg.row->updated = TRUE;
+                    widg.row->active        = widg.selected_row;
+                    widg.row->updated       = TRUE;
 
                 } else if (info.selected_column == 3) {
                     ModeGroup *m = &widg.row->modes[widg.selected_row];
-                    widg.row->res_width  = m->width;
-                    widg.row->res_height = m->height;
-                    widg.row->refresh    = m->refresh_rates[0];
-                    widg.row->updated    = TRUE;
+                    widg.row->res_width     = m->width;
+                    widg.row->res_height    = m->height;
+                    widg.row->refresh       = m->refresh_rates[0];
+                    widg.row->cur_mode      = m->mode_id[0];
+                    widg.row->updated       = TRUE;
 
                 } else if (info.selected_column == 4) {
                     ModeGroup *m = NULL;
-                    for (int i = 0; i < widg.row->mode_count; i++)
+                    for (unsigned int i = 0; i < widg.row->mode_count; i++)
                         if (resolution_equals(&widg.row->modes[i], widg.row))
                             m = &widg.row->modes[i];
 
                     if (m) {
                         widg.row->refresh =
                             m->refresh_rates[widg.selected_row];
-                        widg.row->updated = TRUE;
+                        widg.row->cur_mode  = m->mode_id[widg.selected_row];
+                        widg.row->updated   = TRUE;
                     }
                 }
                 mode = MODE_TABLE;
-                clear();
+                wclear(stdscr);
                 break;
             }
             break;
@@ -678,7 +656,7 @@ int main(void)
         case MODE_WBUFFER:
             if (key == 'h' || is_esc) {
                 mode = MODE_TABLE;
-                clear();
+                wclear(stdscr);
                 break;
             }
             if (key == 'l' || is_enter) {
@@ -689,7 +667,7 @@ int main(void)
 
                 widg.row->updated = TRUE;
                 mode = MODE_TABLE;
-                clear();
+                wclear(stdscr);
                 break;
             }
 
@@ -725,199 +703,9 @@ int main(void)
             break;
         }
 
-        refresh();
+        wrefresh(stdscr);
     }
 
     endwin();
     return 0;
 }
-
-// int main(){
-//     DisplayInfo info;
-//     Widget widg;
-//     UiMode mode =  MODE_TABLE;
-//     //printf("Size: %d\n", sizeof(DisplayInfo));
-//     int rows, cols;
-//     int table_mode = 1;
-   
-//     get_randr_outputs(&info);
-//     //if (get_randr_outputs(&info) == 0) {
-//     //    for (int i = 0; i < info.count; i++) {
-//     //        printf("Output: %s (%dx%d @ %.2fHz)\n",
-//     //            info.outputs[i].name,
-//     //            info.outputs[i].res_width,
-//     //            info.outputs[i].res_height,
-//     //            info.outputs[i].refresh);
-//     //    }
-//     //}
-//     initscr();
-//     getmaxyx(stdscr, rows, cols);
-//     keypad(stdscr, TRUE);
-//     if (has_colors()) init_color(0, 0, 0, 0);
-//     curs_set(0);
-//     noecho();
-//     info.selected_row = 0;
-//     render_table(&info);
-//     mvprintw(rows-1, 0, BAR);
-//     refresh(); 
-//     //S
-//     int key;
-//     while(true) {
-//         key = getchar();
-//         if(key == 'q') break;
-//         if(key == 'r') get_randr_outputs(&info);
-//         if(key == 's') apply_xrandr_cli(&info);
-//         switch (mode) {
-//             case MODE_TABLE:
-//                 switch (key) {
-//                     case 'h':
-//                         if (info.selected_column > 0) info.selected_column--;
-//                         break;
-//                     case 'l':
-//                         if (info.selected_column < 7 - 1) info.selected_column++;
-//                         break;
-
-//                     case 'k':
-//                         if (info.selected_row > 0) info.selected_row--;
-//                         break;
-
-//                     case 'j':
-//                         if (info.selected_row < info.count - 1) info.selected_row++;
-//                         break;
-
-//                     case 'i':
-//                         if (info.selected_column == 0)
-//                             break;
-//                         widg.row = &info.outputs[info.selected_row];
-//                         widg.rownumber = info.selected_row;
-//                         switch (info.selected_column) {
-//                             case 1: case 3: case 4:
-//                                 mode = MODE_SELECT;
-//                                 widg.first = 1;
-//                                 break;
-//                             case 5: case 6:
-//                                 mode = MODE_WBUFFER;
-//                                 widg.buffer_size = snprintf(widg.buffer, 12, "%d", widg.row->x);
-//                                 break;
-//                         }
-//                         break;
-//                 }
-//                 break;
-//             case MODE_SELECT:
-//                 switch (key) {
-//                     case 'h':
-//                         mode = MODE_TABLE;
-//                         clear();
-//                         mvprintw(
-//                             rows - 1, 0, BAR
-//                         );
-//                         break;
-
-//                     case 'k':
-//                         if (widg.selected_row > 0)
-//                             widg.selected_row--;
-//                         break;
-
-//                     case 'j':
-//                         switch (info.selected_column) {
-//                              case 1: case 2:
-//                                 if (widg.selected_row < 1)
-//                                     widg.selected_row++;
-//                                 break;
-//                             case 3:
-//                                 if (widg.selected_row < widg.row->mode_count - 1)
-//                                     widg.selected_row++;
-//                                 break;
-//                             case 4:
-//                                 OutputInfo *_info = widg.row;
-//                                 ModeGroup *_mode;
-//                                 for (int i = 0; i < _info->mode_count; i++) 
-//                                     if (resolution_equals(&_info->modes[i], _info)) 
-//                                         _mode = &_info->modes[i];
-//                                 if (widg.selected_row < _mode->refresh_count - 1)
-//                                     widg.selected_row++;
-//                                 break;
-//                         }
-//                         break;
-//                     case 'l':
-//                         switch (info.selected_column) {
-//                             case 1:
-//                                 widg.row->active = widg.selected_row;
-//                                 widg.row->updated = TRUE;
-//                                 break;
-//                             case 3:
-//                                 widg.row->res_height =
-//                                     widg.row->modes[widg.selected_row].height;
-//                                 widg.row->res_width =
-//                                     widg.row->modes[widg.selected_row].width;
-//                                 widg.row->refresh = widg.row->modes[widg.selected_row].refresh_rates[0];
-//                                 widg.row->updated = TRUE;
-//                                 break;
-//                             case 4:
-//                                 OutputInfo *info = widg.row;
-//                                 ModeGroup *_mode;
-//                                 for (int i = 0; i < info->mode_count; i++) 
-//                                     if (resolution_equals(&info->modes[i], info)) 
-//                                         _mode = &info->modes[i];
-//                                 widg.row->refresh = _mode->refresh_rates[widg.selected_row];
-//                                 widg.row->updated = TRUE;
-//                                 break;
-//                         }
-//                         break;
-//                 }
-//                 break;
-//             case MODE_WBUFFER:
-//                 if (key == 'h'){
-//                     mode = MODE_TABLE;
-//                     clear();
-//                     mvprintw(
-//                         rows - 1, 0,
-//                         "h(left), j(down), k(up), l(right) move | "
-//                         "i edit | h exit edit | q quit | "
-//                         "s sync monitors | r reload"
-//                     );
-//                 }
-//                 if (key == 'l'){
-//                     if (info.selected_column == 5) widg.row->x = atoi(widg.buffer);
-//                     if (info.selected_column == 6) widg.row->y = atoi(widg.buffer);
-//                     widg.row->updated = TRUE;
-//                 }
-//                 if (key == 'x' && widg.buffer_size > 0){
-//                     widg.buffer[--widg.buffer_size] = '\0';
-//                 }
-//                 if ('0' <= key && key <= '9' && widg.buffer_size < 11){
-//                     widg.buffer[widg.buffer_size++] = key;
-//                     widg.buffer[widg.buffer_size] = '\0';
-//                 }
-//                 break;
-
-//         }
-            
-        
-//         switch (mode) {
-//             case MODE_TABLE:
-//                 render_table(&info);
-//                 break;
-//             case MODE_SELECT:
-//                 switch (info.selected_column) {
-//                     case 1:
-//                         selectwidget_active(&widg);
-//                         break;
-//                     case 3:
-//                         selectwidget_resolution(&widg);
-//                         break;
-//                     case 4:
-//                         selectwidget_refresh(&widg);
-//                         break;
-                    
-//                 }
-//                 break;
-//             case MODE_WBUFFER:
-//                 bufferwiget(&widg, info.selected_column);
-//                 break;
-//         } 
-//         refresh(); 
-//     }
-//     endwin();
-//     return 0;
-// }
